@@ -2,46 +2,79 @@
 
 if [ "$1" = "debug" ] ; then DEBUG=1 ; else DEBUG=0 ; fi
 
-# Exit if still runs
-me=$(basename $0); running=$(ps h -C $me | grep -v $$ | wc -l); [[ $running > 1 ]] && exit;
-
 BC=`which bc`
 DATE=`which date`
 JQ=`which jq`
 WGET=`which wget`
 TIMEOUT=`which timeout`
+GREP=`which grep`
+CURL=`which curl`
+NETSTAT=`which netstat`
+PIDOF=`which pidof`
 
-SLACKCHANNEL=<YOUR SLACKCHANNEL>
-SLACK_HOOK_URL=https://hooks.slack.com/services/xxxxx/xxxxx/xxxxx
+# Exit if still runs
+if [ $($PIDOF -x "$0" | wc -w) -ne 2 ] ; then exit ; fi
+
+SLACKCHANNEL=YOU_SLACK_CHANNEL_NAME
+SLACK_HOOK_URL=https://hooks.slack.com/services/YOUR/SERVICE/CODE
 
 # Brutto Strompreis in ct/kWh mit PUNKT als Trenner
 STROMPREIS=30.59
-MYPATH=/wo/dein/krempl/liegt
+# Sekunden der Stoperkennung
+STOPSEC=180
+MYPATH=/home/pi/SlackMySteckdose
 RAMDISK=/ramdisk
 TPLINK=$MYPATH/tplink-smartplug.py
+OWNIP=$(/sbin/ifconfig -a | $GREP "inet .*netmask.*broadcast" | $GREP -v "127.0" | head -1 | awk '{print $2}')
+PREFIX=$(echo $OWNIP | cut -d"." -f1-3)
+GW=$($NETSTAT -rn | $GREP default.*${PREFIX} | awk '{print $2}' | head -1)
+
 
 if [ ! -d $RAMDISK ] ; then echo "NO RAMDISK - exiting ..." ; exit ; fi
 
 # Dieses Gerät ist
+touch ${RAMDISK}/raspi_$(/sbin/ifconfig -a | $GREP "ether " | awk '{print $2}' | head -1)
 OWNMAC=$(ls -1 ${RAMDISK}/raspi* | cut -d "_" -f2)
-
 if [ ! $OWNMAC ] ; then echo "NO own MAC detectet - exiting ..." ; exit ; fi
 
-# Read ignore list
-IGNORE=$($TIMEOUT 2 $MQSUB -v $BROKER -t 'SmartBurg/+/+/ignore' | cut -d"/" -f3)
-rm -rf ${RAMDISK}/ignore_*
-for TOUCH in $IGNORE ; do 
-	touch ${RAMDISK}/ignore_${TOUCH}
-	touch ${MYPATH}/ignore_${TOUCH}
-	rm -f ${MYPATH}/start_${TOUCH}_*
-	rm -f ${MYPATH}/stop_${TOUCH}_*
-	if [ $DEBUG -eq 1 ] ; then echo "# --- Ignoreliste: $TOUCH" ; fi
+# Finde alle Steckdosen im Netz
+# Beispiel DHCP Bereich ist von .20 bis .200
+for IP in {20..200} ; do
+	if [ $DEBUG -eq 1 ] ; then echo -n "." ; fi
+
+	/bin/nc -w 1 -z ${PREFIX}.${IP} 9999 2>/dev/null || continue
+	GOTCHA="$GOTCHA ${IP} "
+
+	if [ $DEBUG -eq 1 ] ; then echo -n "[${IP}]" ; fi
 done
+if [ $DEBUG -eq 1 ] ; then echo ; echo "Gotcha: $GOTCHA"  ; fi
+
+# Lege Hilfsdateien unter $RAMDISK an
+IP=""
+for IP in $GOTCHA ; do
+
+	JSON=$(${TPLINK} -t ${PREFIX}.${IP} -c info | $GREP ^Received | /usr/bin/cut -d ":" -f2-)
+
+	if [ "$(echo $JSON | jq -r '.system.get_sysinfo.model')" == "HS110(EU)" ] ; then
+
+		MAC=$(echo $JSON | jq -r '.system.get_sysinfo.mac')
+		ALIAS=$(echo $JSON | jq -r '.system.get_sysinfo.alias')
+		
+		touch ${RAMDISK}/HS110_${MAC}_${PREFIX}.${IP}
+		if [ $DEBUG -eq 1 ] ; then echo "touch ${RAMDISK}/HS110_${MAC}_${PREFIX}.${IP}" ; fi
+
+	fi
+done
+
+
+# Aufräumen
+rm -rf ${RAMDISK}/ignore_* ${RAMDISK}/start_* ${RAMDISK}/stop_*
 
 # Endlosschleife
 # Endlosschleife
 # Endlosschleife
 while true ; do
+IP=""
 
 # Ausgelesen um
 ZEIT=$($DATE +%s)
@@ -54,11 +87,11 @@ $SLEEP
 for IP in $(ls -1 ${RAMDISK}/HS110* | cut -d "_" -f3) ; do
 MAC=$(ls -1 ${RAMDISK}/HS110*${IP} | cut -d"_" -f2)
 
-# Script-Sprung, wenn die Dose nicht erreichbar ist
+# Script-Sprung, wenn die Dose kurzzeitig mal nicht erreichbar ist
 $TIMEOUT 1 bash -c "cat < /dev/null > /dev/tcp/${IP}/9999 2> /dev/null" || continue
 
 # Aktuelle Steckdose auslesen
-EMETER=$($TPLINK -t $IP -c emeter | grep ^Received | cut -d ":" -f2-)
+EMETER=$($TPLINK -t $IP -c emeter | $GREP ^Received | cut -d ":" -f2-)
 POWER=$(echo $EMETER | $JQ '.emeter.get_realtime.power' | cut -d "." -f1)
 
 # continue loop if device is on ignore list
@@ -91,8 +124,8 @@ if [ $POWER -lt 5 ] ; then
 		# Ausschalteerkennung
 		# Ausschalteerkennung
 		# Ausschalteerkennung
-		if [ $DELTA -gt 180 ] ; then 
-			INFO=$($TPLINK -t $IP -c info | grep ^Received | cut -d ":" -f2-)
+		if [ $DELTA -gt $STOPSEC ] ; then 
+			INFO=$($TPLINK -t $IP -c info | $GREP ^Received | cut -d ":" -f2-)
 			RUN=$(( $SINCE - $(ls -1 ${MYPATH}/start_${MAC}_* | cut -d"_" -f3) ))
 			KWSTART=$(ls -1 ${MYPATH}/start_${MAC}_* | cut -d"_" -f4)
 			KWSTOP=$(ls -1 ${MYPATH}/stop_${MAC}_* | cut -d"_" -f4)
@@ -108,18 +141,21 @@ if [ $POWER -lt 5 ] ; then
 
 			# Notify detections only above 5Wh
 			if [ $VERBRAUCH -gt 5 ] ; then
-			SLACK=$(curl --silent -X POST --data-urlencode "payload={\"channel\": \"${SLACKCHANNEL}\", \"username\": \"SmartBurg\", \"text\": \"${MELDUNG}\", \"icon_emoji\": \"${EMOJI}\"}" $SLACK_HOOK_URL)
+			SLACK=""
+			SLACK=$($CURL --silent -X POST --data-urlencode "payload={\"channel\": \"${SLACKCHANNEL}\", \"username\": \"SmartBurg\", \"text\": \"${MELDUNG}\", \"icon_emoji\": \"${EMOJI}\"}" $SLACK_HOOK_URL)
 			fi
 
-			#### Hier kann noch der SLACK=ok Check rein vor dem löschen
-			rm -f ${MYPATH}/start_${MAC}_*
-			rm -f ${MYPATH}/stop_${MAC}_*
+			if [ "$SLACK" == "ok" ] ; then
+				rm -f ${MYPATH}/start_${MAC}_*
+				rm -f ${MYPATH}/stop_${MAC}_*
+				echo "$CURL --silent -X POST --data-urlencode \"payload={\"channel\": \"${SLACKCHANNEL}\", \"username\": \"SmartBurg\", \"text\": \"${MELDUNG}\", \"icon_emoji\": \"${EMOJI}\"}\" $SLACK_HOOK_URL"
+			fi
 		fi
 	fi
 	continue
 fi
 
-INFO=$($TPLINK -t $IP -c info | grep ^Received | cut -d ":" -f2-)
+INFO=$($TPLINK -t $IP -c info | $GREP ^Received | cut -d ":" -f2-)
 MAC=$(echo $INFO | $JQ -r '.system.get_sysinfo.mac')
 
 # Einschalterkennung
@@ -140,7 +176,7 @@ if [ $(ls -1 ${MYPATH}/start_${MAC}_* 2>/dev/null | wc -l) -eq 0 ] ; then
 		echo "# --- SLACK: $MELDUNG"
 	fi
 	touch ${MYPATH}/start_${MAC}_${ZEIT}_$(echo $EMETER | $JQ -r '.emeter.get_realtime.total')
-	SLACK=$(curl --silent -X POST --data-urlencode "payload={\"channel\": \"${SLACKCHANNEL}\", \"username\": \"SmartBurg\", \"text\": \"${MELDUNG}\", \"icon_emoji\": \"${EMOJI}\"}" $SLACK_HOOK_URL)
+	SLACK=$($CURL --silent -X POST --data-urlencode "payload={\"channel\": \"${SLACKCHANNEL}\", \"username\": \"SmartBurg\", \"text\": \"${MELDUNG}\", \"icon_emoji\": \"${EMOJI}\"}" $SLACK_HOOK_URL)
 else
 	rm -f ${MYPATH}/stop_${MAC}_*
 	if [ $DEBUG -eq 1 ] ; then echo "# --- Löschen stop Datei für ${MAC}" ; fi
